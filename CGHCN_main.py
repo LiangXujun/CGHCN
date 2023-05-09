@@ -1,0 +1,214 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Oct 18 12:37:32 2022
+
+@author: liangxj
+"""
+
+#%%
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch_geometric.nn import GraphConv
+
+import math
+import numpy as np
+
+from copy import deepcopy
+from tqdm import tqdm
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+import os
+os.chdir(os.path.realpath(os.path.join(__file__, '..')))
+from prepareData import prepare_data
+
+np.random.seed(123)
+torch.manual_seed(123)
+torch.cuda.manual_seed(123)
+torch.cuda.manual_seed_all(123)
+torch.backends.cudnn.deterministic = True
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+#%%
+class Config(object):
+    def __init__(self):
+        self.data_path = './datasets/data(383-495)'
+        self.nfold = 5
+        self.n_rep = 10 
+        self.alpha = 0.2
+        self.k_neig = 30
+        self.emb_dim = 64
+        self.hid_dim = 64
+        self.dropout = 0.0
+        self.num_epoches = 500
+
+
+def impute_zeros(inMat,inSim,k=10):
+	mat = deepcopy(inMat)
+	sim = deepcopy(inSim)
+	(row,col) = mat.shape
+ 	# np.fill_diagonal(mat,0)
+	indexZero = np.where(~mat.any(axis=1))[0]
+	numIndexZeros = len(indexZero)
+
+	np.fill_diagonal(sim,0)
+	if numIndexZeros > 0:
+		sim[:,indexZero] = 0
+	for i in indexZero:
+		currSimForZeros = sim[i,:]
+		indexRank = np.argsort(currSimForZeros)
+
+		indexNeig = indexRank[-k:]
+		simCurr = currSimForZeros[indexNeig]
+
+		mat_known = mat[indexNeig, :]
+		
+		if sum(simCurr) >0:  
+			mat[i,: ] = np.dot(simCurr ,mat_known) / sum(simCurr)
+	return mat
+
+
+def generate_G_from_H(H):
+    DV = np.sum(H, axis=1)
+    DE = np.sum(H, axis=0)
+    DV[DV==0] = np.inf
+    DE[DE==0] = np.inf
+    invDE = np.mat(np.diag(np.power(DE, -1)))
+    DV2 = np.mat(np.diag(np.power(DV, -0.5)))
+    H = np.mat(H)
+    HT = H.T
+    G = DV2 @ H @ invDE @ HT @ DV2
+    return G
+
+
+class HGNN_conv(nn.Module):
+    def __init__(self, in_ft, out_ft, bias=True):
+        super(HGNN_conv, self).__init__()
+
+        self.weight = nn.Parameter(torch.Tensor(in_ft, out_ft))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(out_ft))
+        else:
+            self.register_parameter('bias', None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1. / math.sqrt(self.weight.size(1))
+        self.weight.data.uniform_(-stdv, stdv)
+        if self.bias is not None:
+            self.bias.data.uniform_(-stdv, stdv)
+
+    def forward(self, x: torch.Tensor, G: torch.Tensor):
+        # z = x.matmul(self.weight)
+        # if self.bias is not None:
+            # z = z + self.bias
+        z = G.matmul(x) + x
+        return z
+
+
+class HGNN_embedding(nn.Module):
+    def __init__(self, in_ch, n_hid, dropout=0.1):
+        super(HGNN_embedding, self).__init__()
+        self.dropout = dropout
+        self.hgc1 = HGNN_conv(in_ch, n_hid)
+        # self.hgc2 = HGNN_conv(n_hid, n_hid)
+
+    def forward(self, x, G):
+        x = F.dropout(x, self.dropout)
+        x = self.hgc1(x, G)
+        # x = F.dropout(x, self.dropout)
+        # x = self.hgc2(x, G)
+        return x
+
+
+class Net(nn.Module):
+    def __init__(self, opt, num_users, num_items):
+        super(Net, self).__init__()
+        self.dropout = opt.dropout
+        self.user_emb = nn.Parameter(nn.init.xavier_normal_(torch.empty(num_users, opt.emb_dim)))
+        self.item_emb = nn.Parameter(nn.init.xavier_normal_(torch.empty(num_items, opt.emb_dim)))
+        self.user_encoder_s = GraphConv(opt.emb_dim, opt.hid_dim)
+        self.item_encoder_s = GraphConv(opt.emb_dim, opt.hid_dim)
+        self.user_encoder = HGNN_embedding(opt.hid_dim, opt.hid_dim, 0)
+        self.item_encoder = HGNN_embedding(opt.hid_dim, opt.hid_dim, 0)
+        # self.decoder = BiDecoder(args.hid_dim, args.bdc_dropout)
+
+    def forward(self, Gs, Gh):
+        user_Gs = Gs['user']
+        item_Gs = Gs['item']
+        user_Gh = Gh['user']
+        item_Gh = Gh['item']
+        
+        user_x = F.dropout(self.user_emb, 0)
+        item_x = F.dropout(self.item_emb, 0)
+        
+        user_z1 = self.user_encoder_s(user_x, user_Gs)
+        item_z1 = self.item_encoder_s(item_x, item_Gs)
+        
+        user_z1 = F.dropout(user_z1, self.dropout)
+        item_z1 = F.dropout(item_z1, self.dropout)
+        
+        user_z = self.user_encoder(user_z1, user_Gh)
+        item_z = self.item_encoder(item_z1, item_Gh)
+        # pred_ratings = self.decoder({'user':user_z, 'item':item_z})
+        pred_ratings = torch.mm(user_z, item_z.t())
+        return pred_ratings
+
+#%%
+opt = Config()
+
+dataset = prepare_data(opt)
+num_users, num_items = dataset['md_p'].shape
+
+
+graph_d = np.array(np.where(dataset['dd_g']))
+graph_m = np.array(np.where(dataset['mm_g']))
+
+Gd_s = torch.LongTensor(graph_d).to(device)
+Gm_s = torch.LongTensor(graph_m).to(device)
+Gs = {'user':Gm_s, 'item':Gd_s}
+
+aucs = np.zeros((opt.nfold, opt.n_rep))
+auprs = np.zeros((opt.nfold, opt.n_rep))
+
+
+for ir in range(opt.n_rep):
+    kf = KFold(n_splits = opt.nfold, shuffle = True)
+    for ik, (train, test) in enumerate(kf.split(range(num_users))):
+        Htrain = dataset['md_p'].copy() 
+        Htrain[test,] = 0
+        Htrain = impute_zeros(Htrain, dataset['mm']['data'])
+        
+        Hm = np.minimum(np.c_[Htrain, Htrain@(Htrain.T@Htrain)], 1)
+        Hd = np.minimum(np.c_[Htrain.T, Htrain.T@(Htrain@Htrain.T)], 1)
+        
+        Gm = generate_G_from_H(Hm)
+        Gd = generate_G_from_H(Hd)
+        
+        Htrain = torch.tensor(Htrain, dtype = torch.float).to(device)
+        Gh = {'user':torch.tensor(Gm, dtype = torch.float).to(device), 'item':torch.tensor(Gd, dtype = torch.float).to(device)}
+        model = Net(opt, num_users, num_items).to(device)
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr = 1e-3, weight_decay=1e-4)
+        for epoch in tqdm(range(opt.num_epoches)):
+            scores = model(Gs, Gh)
+            loss = F.binary_cross_entropy_with_logits(scores, Htrain)
+            # loss = (1 - opt.alpha)*loss_sum[train,].sum() + opt.alpha*loss_sum[test,].sum()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        model.eval()
+        y_score = model(Gs, Gh).detach().cpu().numpy()
+        test = test[dataset['md_p'][test,].sum(1)!=0]
+        auc = roc_auc_score(dataset['md_p'][test,], y_score[test,], average = 'samples')
+        aupr = average_precision_score(dataset['md_p'][test,], y_score[test,], average = 'samples')
+        aucs[ik,ir] = auc
+        auprs[ik,ir] = aupr
+
+
+#%%
+print(np.mean(aucs), np.mean(auprs))
+print(np.std(aucs), np.std(auprs))
+np.savez('/result/CGHCN_DS1_local_result.npz', aucs, auprs)
