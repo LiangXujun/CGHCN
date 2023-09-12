@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Aug 30 15:15:47 2022
-
-@author: liangxj
-"""
-#%%
 import csv
 import torch
 import random
