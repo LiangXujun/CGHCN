@@ -211,7 +211,7 @@ for ir in range(opt.n_rep):
         Gh = {'user':torch.tensor(Gm, dtype = torch.float).to(device), 'item':torch.tensor(Gd, dtype = torch.float).to(device)}
         model = Net(opt, num_users, num_items).to(device)
         model.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr = 1e-3, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(model.parameters(), lr = 1e-3, weight_decay=5e-4)
         for epoch in tqdm(range(opt.num_epoches)):
             scores = model(Gs, Gh)
             loss = F.binary_cross_entropy_with_logits(scores, Htrain)
