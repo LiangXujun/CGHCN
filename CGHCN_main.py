@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Tue Oct 18 12:37:32 2022
-
-@author: liangxj
-"""
-
 #%%
 import torch
 from torch import nn
@@ -33,16 +26,51 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 #%%
 class Config(object):
     def __init__(self):
-        self.data_path = './datasets/data(383-495)'
+        self.data_path = './datasets/dataset1'
         self.nfold = 5
         self.n_rep = 10 
-        self.alpha = 0.2
-        self.k_neig = 30
+        self.k_neig = 10
         self.emb_dim = 64
         self.hid_dim = 64
         self.dropout = 0.0
         self.num_epoches = 500
 
+def calculate_evaluation_metrics(pred_mat, pos_edges, neg_edges):
+    pos_pred_socres = pred_mat[pos_edges[0], pos_edges[1]]
+    neg_pred_socres = pred_mat[neg_edges[0], neg_edges[1]]
+    pred_scores = np.hstack((pos_pred_socres, neg_pred_socres))
+    true_labels = np.hstack((np.ones(pos_pred_socres.shape[0]), np.zeros(neg_pred_socres.shape[0])))
+
+    auc = roc_auc_score(true_labels, pred_scores)
+    average_precision = average_precision_score(true_labels, pred_scores)
+
+    pred_scores_mat = np.mat([pred_scores])
+    true_labels_mat = np.mat([true_labels])
+    sorted_predict_score = np.array(sorted(list(set(np.array(pred_scores_mat).flatten()))))
+    sorted_predict_score_num = len(sorted_predict_score)
+    thresholds = sorted_predict_score[
+        (np.array([sorted_predict_score_num]) * np.arange(1, 1000) / np.array([1000])).astype(int)]
+    thresholds = np.mat(thresholds)
+    thresholds_num = thresholds.shape[1]
+
+    predict_score_matrix = np.tile(pred_scores_mat, (thresholds_num, 1))
+    negative_index = np.where(predict_score_matrix < thresholds.T)
+    positive_index = np.where(predict_score_matrix >= thresholds.T)
+    predict_score_matrix[negative_index] = 0
+    predict_score_matrix[positive_index] = 1
+
+    TP = predict_score_matrix * true_labels_mat.T
+    FP = predict_score_matrix.sum(axis=1) - TP
+    FN = true_labels_mat.sum() - TP
+    TN = len(true_labels_mat.T) - TP - FP - FN
+    tpr = TP / (TP + FN)
+    f1_score_list = 2 * TP / (len(true_labels_mat.T) + TP - TN)
+    accuracy_list = (TP + TN) / len(true_labels_mat.T)
+
+    max_index = np.argmax(f1_score_list)
+    f1_score = f1_score_list[max_index, 0]
+    accuracy = accuracy_list[max_index, 0]
+    return np.array([auc, average_precision, f1_score, accuracy])
 
 def impute_zeros(inMat,inSim,k=10):
 	mat = deepcopy(inMat)
@@ -100,9 +128,6 @@ class HGNN_conv(nn.Module):
             self.bias.data.uniform_(-stdv, stdv)
 
     def forward(self, x: torch.Tensor, G: torch.Tensor):
-        # z = x.matmul(self.weight)
-        # if self.bias is not None:
-            # z = z + self.bias
         z = G.matmul(x) + x
         return z
 
@@ -112,13 +137,10 @@ class HGNN_embedding(nn.Module):
         super(HGNN_embedding, self).__init__()
         self.dropout = dropout
         self.hgc1 = HGNN_conv(in_ch, n_hid)
-        # self.hgc2 = HGNN_conv(n_hid, n_hid)
 
     def forward(self, x, G):
         x = F.dropout(x, self.dropout)
         x = self.hgc1(x, G)
-        # x = F.dropout(x, self.dropout)
-        # x = self.hgc2(x, G)
         return x
 
 
@@ -148,10 +170,11 @@ class Net(nn.Module):
         
         user_z1 = F.dropout(user_z1, self.dropout)
         item_z1 = F.dropout(item_z1, self.dropout)
-        
+	    
         user_z = self.user_encoder(user_z1, user_Gh)
         item_z = self.item_encoder(item_z1, item_Gh)
-        # pred_ratings = self.decoder({'user':user_z, 'item':item_z})
+        # user_z = torch.concat([user_x, user_z1, user_z2], 1)
+        # item_z = torch.concat([item_x, item_z1, item_z2], 1)
         pred_ratings = torch.mm(user_z, item_z.t())
         return pred_ratings
 
@@ -169,9 +192,7 @@ Gd_s = torch.LongTensor(graph_d).to(device)
 Gm_s = torch.LongTensor(graph_m).to(device)
 Gs = {'user':Gm_s, 'item':Gd_s}
 
-aucs = np.zeros((opt.nfold, opt.n_rep))
-auprs = np.zeros((opt.nfold, opt.n_rep))
-
+metric_tab = np.zeros((opt.nfold, opt.n_rep, 4))
 
 for ir in range(opt.n_rep):
     kf = KFold(n_splits = opt.nfold, shuffle = True)
@@ -202,13 +223,8 @@ for ir in range(opt.n_rep):
         model.eval()
         y_score = model(Gs, Gh).detach().cpu().numpy()
         test = test[dataset['md_p'][test,].sum(1)!=0]
-        auc = roc_auc_score(dataset['md_p'][test,], y_score[test,], average = 'samples')
-        aupr = average_precision_score(dataset['md_p'][test,], y_score[test,], average = 'samples')
-        aucs[ik,ir] = auc
-        auprs[ik,ir] = aupr
-
+        metrics = calculate_evaluation_metrics(y_score[test,], np.where(dataset['md_p'][test,]==1), np.where(dataset['md_p'][test,]==0))
+	metrics_tab[ik,ir,] = metrics
 
 #%%
-print(np.mean(aucs), np.mean(auprs))
-print(np.std(aucs), np.std(auprs))
-np.savez('/result/CGHCN_DS1_local_result.npz', aucs, auprs)
+np.savez('/result/CGHCN_DS1_local_result.npz', )
